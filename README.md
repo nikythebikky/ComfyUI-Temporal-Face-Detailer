@@ -47,24 +47,95 @@ The all-in-one node and the split path share the same internals — use the
 split nodes when you want to inspect/tune tracking separately from detailing
 (tracking runs once, so you can iterate on sampler settings cheaply).
 
-### Quick start (all-in-one)
+## Connecting the nodes
 
-`Load Video → Temporal Face Detailer → Video Combine`. Connect your SDXL
-`MODEL`/`CLIP`/`VAE`, type prompts (or feed `CONDITIONING` into the optional
-`positive`/`negative` inputs — they take precedence). Defaults are the
-**least-flicker preset**.
+Frame batches come from a video loader such as VideoHelperSuite's
+**Load Video (Upload)** (its `IMAGE` output is the frame batch) and go back
+into its **Video Combine** node. Model/CLIP/VAE come from a normal
+**Load Checkpoint** (SDXL).
 
-### Split path
+### Workflow 1 — all-in-one (easy path)
 
-`Face Detect + Track → Tracked Face Detail → (optional Temporal Smooth) → Video Combine`
+```
+Load Checkpoint ──MODEL──────────────┐
+        ├────────CLIP────────────────┤
+        └────────VAE─────────────────┤
+                                     ▼
+Load Video ──IMAGE──▶  Temporal Face Detailer  ──image──────▶ Video Combine
+                             │                 ──face_masks──▶ (optional: Preview/Save)
+                             │                 ──debug_overlay▶ Video Combine (2nd one, to inspect tracks)
+                             │                 ──face_tracks─▶ (optional: Face Track Preview)
+                       type prompts into
+                       positive_text / negative_text
+```
+
+Socket by socket:
+
+| Temporal Face Detailer input | Connect from |
+|------------------------------|--------------|
+| `image` | Load Video → `IMAGE` |
+| `model` / `clip` / `vae` | Load Checkpoint → `MODEL` / `CLIP` / `VAE` |
+| `positive_text` / `negative_text` | type prompts directly (widgets, no wire needed) |
+| `positive` / `negative` (optional) | CLIP Text Encode → `CONDITIONING`, if you prefer encode nodes; these override the text widgets |
+| `lora_stack` (optional) | TFD LoRA Stack → `LORA_STACK` |
+
+| Output | Connect to |
+|--------|-----------|
+| `image` | Video Combine → `images` (the final video) |
+| `face_masks` | optional — Preview Image (via Mask To Image) or Save, for inspection |
+| `debug_overlay` | optional — a second Video Combine, to check tracking quality |
+| `face_tracks` | optional — Face Track Preview, or a Tracked Face Detail node for a second pass with different settings |
+
+### Workflow 2 — split path (tunable)
+
+Tracking runs once; you can then iterate on sampler settings cheaply, and
+preview tracks before spending any GPU time on sampling.
+
+```
+Load Video ──IMAGE──┬─▶ Face Detect + Track ──face_tracks──┬─▶ Tracked Face Detail ──image──▶ Video Combine
+                    │            └──debug_overlay──▶ Video │           ▲ ▲ ▲
+                    │                combine/preview       │           │ │ │
+                    └──────────────────────────────────────┴───IMAGE───┘ │ │
+                                                                         │ │
+Load Checkpoint ──MODEL/CLIP/VAE─────────────────────────────────────────┘ │
+TFD LoRA Stack ──LORA_STACK──(optional)─────────────────────────────────────┘
+```
+
+1. **Load Video** `IMAGE` → **Face Detect + Track** `image`.
+2. **Face Detect + Track** `debug_overlay` → a Video Combine or Preview
+   Image node. Run the graph once and check every face has a stable
+   `id N` box before wiring up the detailer.
+3. **Face Detect + Track** `face_tracks` → **Tracked Face Detail**
+   `face_tracks`.
+4. **Load Video** `IMAGE` → **Tracked Face Detail** `image` (yes, the same
+   frames again — the detailer needs the original pixels).
+5. Checkpoint `MODEL`/`CLIP`/`VAE` → **Tracked Face Detail**.
+6. **Tracked Face Detail** `image` → **Video Combine** `images`.
+
+**Temporal Smooth** is already applied inside Tracked Face Detail (on the
+face crops, controlled by `flow_strength`). The standalone node is for
+smoothing *other* sequences — e.g. wire it between any upscaler/AnimateDiff
+output and Video Combine, or after the detailer if you want an extra
+full-frame pass: `Tracked Face Detail image → Temporal Smooth image →
+Video Combine`.
+
+**Face Track Preview** takes `image` (frames) + `face_tracks` and returns
+the overlay — same drawing as `debug_overlay`, useful when you've saved or
+re-routed tracks and want to re-inspect them at any point in the graph.
 
 ### LoRAs
 
 Two ways, both supported:
 1. Apply LoRAs to `MODEL`/`CLIP` *before* the detailer with regular
-   `LoraLoader` nodes.
+   `LoraLoader` nodes: `Load Checkpoint → Load LoRA → detailer`.
 2. Feed a **TFD LoRA Stack** into the `lora_stack` input; the stack is
    applied internally (convenient for face LoRAs you only want on the crops).
+   Stack nodes chain — wire one's `LORA_STACK` output into the next's
+   optional `lora_stack` input to combine several LoRAs:
+
+   ```
+   TFD LoRA Stack (face_lora_A) ──▶ TFD LoRA Stack (face_lora_B) ──▶ detailer lora_stack
+   ```
 
 ### Per-track prompts
 
