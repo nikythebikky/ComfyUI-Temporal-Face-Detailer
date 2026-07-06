@@ -1,0 +1,8 @@
+# Face detection + landmarks (RetinaFace). If install is problematic the
+# nodes fall back to OpenCV YuNet automatically.
+insightface>=0.7.3
+# Swap for onnxruntime-gpu to run the detector on CUDA.
+onnxruntime>=1.16
+opencv-python>=4.8
+numpy>=1.24
+scipy>=1.10

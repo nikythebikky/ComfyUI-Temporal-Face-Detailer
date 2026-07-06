@@ -1,0 +1,18 @@
+[project]
+name = "comfyui-temporal-face-detailer"
+description = "Video FaceDetailer for SDXL in ComfyUI: face tracking, per-track fixed-seed detailing and flow-guided temporal blending to fix faces in videos without flicker."
+version = "0.1.0"
+license = { text = "MIT" }
+dependencies = [
+    "insightface>=0.7.3",
+    "onnxruntime>=1.16",
+    "opencv-python>=4.8",
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.urls]
+Repository = "https://github.com/nikythebikky/ComfyUI-Temporal-Face-Detailer"
+
+[tool.comfy]
+DisplayName = "Temporal Face Detailer"
