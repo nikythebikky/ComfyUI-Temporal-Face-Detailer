@@ -10,6 +10,12 @@ Backends (chosen via the node's ``detector`` widget):
   score). Small and fast; the model file is auto-downloaded once.
 * ``haar`` — OpenCV Haar cascade. No extra downloads or deps, but no
   landmarks and weak on non-frontal faces. Last-resort fallback.
+* ``yolo:<model>`` — any ultralytics YOLO detection model found under
+  ``models/ultralytics`` (Impact-Pack convention, e.g.
+  ``bbox/face_yolov8m_anime.pt``). This is the right choice for anime /
+  stylized faces, which the realistic-face detectors miss or jitter on.
+  Needs ``pip install ultralytics``. Bbox models yield no landmarks;
+  pose-style face models with >=5 keypoints are used when present.
 """
 
 import os
@@ -26,6 +32,39 @@ YUNET_URL = (
 YUNET_FILENAME = "face_detection_yunet_2023mar.onnx"
 
 DETECTOR_CHOICES = ["insightface", "yunet", "haar"]
+
+
+def _ultralytics_model_paths():
+    """Map of selectable YOLO model names -> paths under models/ultralytics."""
+    found = {}
+    try:
+        import folder_paths
+    except Exception:
+        return found
+    try:
+        for n in folder_paths.get_filename_list("ultralytics"):
+            if n.lower().endswith(".pt"):
+                p = folder_paths.get_full_path("ultralytics", n)
+                if p:
+                    found[n] = p
+    except Exception:
+        pass
+    if not found:  # Impact Pack not installed; scan the directory directly
+        base = os.path.join(folder_paths.models_dir, "ultralytics")
+        for sub in ("bbox", "segm", ""):
+            d = os.path.join(base, sub)
+            if not os.path.isdir(d):
+                continue
+            for fn in sorted(os.listdir(d)):
+                if fn.lower().endswith(".pt"):
+                    name = f"{sub}/{fn}" if sub else fn
+                    found[name] = os.path.join(d, fn)
+    return found
+
+
+def detector_choices():
+    """Static backends plus any YOLO models present on disk."""
+    return DETECTOR_CHOICES + [f"yolo:{n}" for n in _ultralytics_model_paths()]
 
 
 class Detection:
@@ -67,6 +106,14 @@ class FaceDetector:
 
     # ------------------------------------------------------------------ init
     def _init_backend(self):
+        if self.backend.startswith("yolo:"):
+            try:
+                self._init_yolo()
+                return
+            except Exception as e:
+                print(f"[TemporalFaceDetailer] YOLO detector unavailable "
+                      f"({e}); falling back to insightface.")
+                self.backend = "insightface"
         if self.backend == "insightface":
             try:
                 self._init_insightface()
@@ -120,6 +167,17 @@ class FaceDetector:
             top_k=200,
         )
 
+    def _init_yolo(self):
+        from ultralytics import YOLO
+
+        name = self.backend.split(":", 1)[1]
+        path = _ultralytics_model_paths().get(name)
+        if path is None:
+            raise FileNotFoundError(
+                f"YOLO model '{name}' not found under models/ultralytics")
+        self._impl = YOLO(path)
+        self._yolo_device = "cuda:0" if self.device == "cuda" else "cpu"
+
     def _init_haar(self):
         path = os.path.join(cv2.data.haarcascades,
                             "haarcascade_frontalface_default.xml")
@@ -131,7 +189,9 @@ class FaceDetector:
     # ---------------------------------------------------------------- detect
     def detect(self, frame_rgb_u8: np.ndarray):
         """Detect faces in one uint8 RGB frame -> list[Detection]."""
-        if self.backend == "insightface":
+        if self.backend.startswith("yolo:"):
+            dets = self._detect_yolo(frame_rgb_u8)
+        elif self.backend == "insightface":
             dets = self._detect_insightface(frame_rgb_u8)
         elif self.backend == "yunet":
             dets = self._detect_yunet(frame_rgb_u8)
@@ -155,6 +215,27 @@ class FaceDetector:
         out.sort(key=lambda d: (d.bbox[2] - d.bbox[0]) * (d.bbox[3] - d.bbox[1]),
                  reverse=True)
         return out[: self.max_faces]
+
+    def _detect_yolo(self, rgb):
+        bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)  # ultralytics expects BGR
+        res = self._impl.predict(bgr, conf=self.det_threshold,
+                                 device=self._yolo_device, verbose=False)[0]
+        if res.boxes is None or len(res.boxes) == 0:
+            return []
+        xyxy = res.boxes.xyxy.cpu().numpy()
+        conf = res.boxes.conf.cpu().numpy()
+        kps_all = None
+        if getattr(res, "keypoints", None) is not None:
+            try:
+                k = res.keypoints.xy.cpu().numpy()  # (n, K, 2)
+                if k.ndim == 3 and k.shape[1] >= 5:
+                    kps_all = k[:, :5]
+            except Exception:
+                pass
+        return [Detection(xyxy[i],
+                          None if kps_all is None else kps_all[i],
+                          conf[i])
+                for i in range(len(xyxy))]
 
     def _detect_insightface(self, rgb):
         bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)

@@ -25,12 +25,19 @@ pip install -r ComfyUI-Temporal-Face-Detailer/requirements.txt
 ```
 
 Notes:
-- `insightface` (RetinaFace) is the recommended detector; its models download
-  automatically into `models/insightface` (shared with ReActor & friends).
-  For a CUDA detector install `onnxruntime-gpu` instead of `onnxruntime`.
+- `insightface` (RetinaFace) is the recommended detector for realistic faces;
+  its models download automatically into `models/insightface` (shared with
+  ReActor & friends). For a CUDA detector install `onnxruntime-gpu` instead
+  of `onnxruntime`.
 - If `insightface` isn't installed, the nodes fall back automatically to
   OpenCV **YuNet** (small ONNX model, auto-downloaded to `models/tfd`) and
   finally to a Haar cascade (no downloads, no landmarks).
+- **Anime / stylized faces**: install `ultralytics` (`pip install
+  ultralytics`) and drop an anime face model (e.g. `face_yolov8m_anime.pt`,
+  the same models Impact Pack uses) into `models/ultralytics/bbox/`. It then
+  appears in the `detector` dropdown as `yolo:bbox/face_yolov8m_anime.pt`.
+  The realistic-face detectors miss or jitter on anime faces, and unstable
+  detection is a root cause of flicker no downstream blending can fix.
 
 ## Nodes
 
@@ -104,7 +111,11 @@ TFD LoRA Stack ──LORA_STACK──(optional)───────────
 1. **Load Video** `IMAGE` → **Face Detect + Track** `image`.
 2. **Face Detect + Track** `debug_overlay` → a Video Combine or Preview
    Image node. Run the graph once and check every face has a stable
-   `id N` box before wiring up the detailer.
+   `id N` box before wiring up the detailer. The overlay shows, per face:
+   detection box + confidence, stabilized crop window + anchor cross,
+   landmarks, `gap` on occlusion-interpolated frames, and the rotation
+   angle when `align_rotation` is on — if boxes flicker or drop out here,
+   fix detection (switch detector) before touching sampler settings.
 3. **Face Detect + Track** `face_tracks` → **Tracked Face Detail**
    `face_tracks`.
 4. **Load Video** `IMAGE` → **Tracked Face Detail** `image` (yes, the same
@@ -152,37 +163,97 @@ specific identities, one per line (get IDs from the debug overlay):
 1. **Stabilized tracked crops** — per-track constant crop size + temporally
    smoothed crop center (`crop_smoothing`), so the sampled window doesn't
    jitter. Removes region jitter, and keeps latent shapes constant.
+   With `crop_anchor: landmarks` (default) the center follows the
+   facial-landmark centroid, which jitters far less than the detection box;
+   `align_rotation` additionally rotation-registers each crop (eye line
+   horizontal, smoothed per track) via a similarity transform that is
+   inverse-warped on paste-back — the sampled face is then near-static even
+   while the head tilts.
 2. **Fixed per-track seed + noise** (`noise_mode: fixed_per_track`) — every
    frame of a track is sampled from the *same* noise, so sampling can't
    diverge frame-to-frame. The biggest identity-stability lever.
 3. **Moderate `denoise`** — default 0.35. Higher = more detail but more
-   flicker; 0.3–0.45 is the sweet spot.
-4. **Flow-guided temporal blend** (`flow_strength`) — Farneback optical flow
+   flicker; 0.3–0.45 is the sweet spot. `denoise_max` enables *adaptive*
+   denoise: steady frames keep the low base value (stay locked) while
+   high-motion frames — where correction is most needed and flicker is
+   masked by motion — ramp toward the max.
+4. **Latent-space temporal blend** (`latent_blend`) — flow-guided EMA on the
+   sampler's *output latents* before VAE decode. Smoothing in the VAE's
+   semantic space tolerates noticeably higher denoise before visible
+   flicker; try `latent_blend 0.3–0.5` when raising denoise above ~0.2.
+5. **Flow-guided pixel temporal blend** (`flow_strength`) — optical flow
    between adjacent *original* crops warps the running result onto each new
    frame and blends it in, occlusion-aware so motion doesn't smear.
-5. **Color match** (`color_match`) — pins each detailed crop's mean/std to
+   `flow_backend` selects Farneback (light, default) or torchvision
+   **RAFT** (`raft_small`/`raft_large`) — much cleaner flow on fast motion;
+   auto-falls back to Farneback on any failure (missing weights, OOM).
+6. **Color match** (`color_match`) — pins each detailed crop's mean/std to
    its own source crop, killing brightness pulsing.
-6. **Feathered, mask-limited paste-back** (`mask_dilation`, `feather`) — only
+7. **Reference anchor** (`reference_image` + `reference_strength`) — biases
+   every detailed frame toward a fixed identity reference instead of only
+   toward its neighbors (see below).
+8. **Feathered, mask-limited paste-back** (`mask_dilation`, `feather`) — only
    the face changes; boundaries don't crawl.
 
-`temporal_strength` is the master knob scaling levers 4–5; each lever also
+`temporal_strength` is the master knob scaling levers 4–6; each lever also
 has its own control and can be disabled individually (set `flow_strength` /
-`color_match` to 0, switch `noise_mode` to `per_frame`, set `crop_smoothing`
-to 0) for A/B comparisons against naive per-frame detailing.
+`latent_blend` / `color_match` to 0, switch `noise_mode` to `per_frame`, set
+`crop_smoothing` to 0) for A/B comparisons against naive per-frame detailing.
+
+## Reference-anchored identity (anti-drift)
+
+Temporal blending keeps frames consistent *with each other*, but a sequence
+can still collectively drift away from the intended identity. Connect a
+face image to the optional `reference_image` input to anchor it:
+
+- the reference face is auto-cropped (any available detector; center crop
+  as fallback) and encoded once;
+- each frame's img2img init latent is nudged toward the reference latent —
+  scaled by `reference_strength × denoise`, so at low denoise (where a
+  differently-posed reference would ghost) the nudge stays negligible;
+- detailed crops are color-anchored to the reference's tone in the face
+  region, on top of the per-frame source match.
+
+For **strong** identity conditioning, patch the `MODEL` with IPAdapter
+FaceID (or similar) *upstream* and feed the patched model into this node —
+crops are sampled with whatever model you provide, so it composes naturally
+with everything above; `reference_image` then acts as a light drift guard
+on top.
 
 ## Key parameters
 
 | Param | Default | Meaning |
 |-------|---------|---------|
 | `denoise` | 0.35 | img2img strength — main quality vs. consistency lever |
+| `denoise_max` | 0.0 (off) | adaptive denoise ceiling: steady frames keep `denoise`, high-motion frames ramp toward this |
 | `guide_size` / `max_size` | 768 / 1024 | resolution crops are resampled at |
 | `crop_factor` | 1.7 | context around the face bbox |
 | `crop_smoothing` | 0.8 | temporal smoothing of the crop window |
+| `crop_anchor` | landmarks | crop centered on landmark centroid (stable) vs. detection bbox |
+| `align_rotation` | false | rotation-register crops to the eye line (needs a landmark detector) |
 | `noise_mode` | fixed_per_track | reuse seed+noise across a track's frames |
 | `detail_mode` | img2img | `inpaint` = latent-masked sampling (face only) |
+| `latent_blend` | 0.0 (off) | flow-guided temporal blend in latent space, before decode |
+| `flow_backend` | farneback | `raft_small` / `raft_large` for cleaner flow on fast motion |
+| `reference_strength` | 0.35 | pull toward `reference_image` (inactive unless connected) |
 | `max_track_gap` | 10 | frames a face may vanish before its track ends; gaps are interpolated |
 | `chunk_size` | 4 | crops sampled per batch — lower it if you OOM |
 | `detail_every` | 1 | keyframe mode: sample every Nth frame, flow-propagate the rest (speed) |
+
+### Suggested settings for anime video (WAN Animate post-pass)
+
+Identity stability first, enhancement second:
+
+- `detector`: `yolo:bbox/<anime face model>.pt` — realistic-face detectors
+  are the root cause of most incoherence on stylized characters.
+- `crop_anchor: landmarks` if your detector provides landmarks; otherwise
+  keep `crop_smoothing` at 0.8–1.0.
+- Keep `denoise` at your validated low value (e.g. 0.15) and instead of
+  raising it globally, enable `latent_blend 0.4` and try `denoise 0.25`;
+  or use `denoise 0.15` + `denoise_max 0.35` for adaptive behavior.
+- `reference_image`: a clean frame of the character's face; start with
+  `reference_strength 0.35`.
+- `flow_backend: raft_small` if clips have fast motion.
 
 ## Hardware notes (tested target: 22 GB 2080 Ti, Turing/SM75)
 

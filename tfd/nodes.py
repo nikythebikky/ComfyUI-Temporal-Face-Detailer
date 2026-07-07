@@ -15,9 +15,9 @@ import comfy.utils
 import folder_paths
 
 from .detailing import detail_tracks, encode_text, parse_track_prompts
-from .detection import DETECTOR_CHOICES, FaceDetector
+from .detection import FaceDetector, detector_choices
 from .face_tracks import draw_debug_overlay, tracks_to_face_tracks
-from .temporal import flow_blend_sequence
+from .temporal import FLOW_BACKENDS, flow_blend_sequence, get_flow_fn
 from .tracking import build_tracks
 from .utils import np_to_tensor, tensor_frame_to_np, tensor_frame_to_np_f32
 
@@ -30,7 +30,13 @@ _SEED_MAX = 0xFFFFFFFFFFFFFFFF
 
 def _detect_inputs():
     return {
-        "detector": (DETECTOR_CHOICES, {"default": "insightface"}),
+        "detector": (detector_choices(),
+                     {"default": "insightface",
+                      "tooltip": "yolo:* entries are ultralytics models "
+                                 "found in models/ultralytics — use an "
+                                 "anime face model (e.g. "
+                                 "bbox/face_yolov8m_anime.pt) for "
+                                 "stylized characters"}),
         "det_threshold": ("FLOAT", {"default": 0.5, "min": 0.05, "max": 1.0,
                                     "step": 0.01}),
         "min_face_size": ("INT", {"default": 24, "min": 8, "max": 1024}),
@@ -51,6 +57,20 @@ def _detect_inputs():
                                      "step": 0.05,
                                      "tooltip": "temporal smoothing of the "
                                                 "crop window (anti-jitter)"}),
+        "crop_anchor": (["landmarks", "bbox"],
+                        {"default": "landmarks",
+                         "tooltip": "landmarks centers the crop on the "
+                                    "facial-landmark centroid (far more "
+                                    "stable than the detection box); falls "
+                                    "back to bbox when the detector yields "
+                                    "no landmarks"}),
+        "align_rotation": ("BOOLEAN",
+                           {"default": False,
+                            "tooltip": "rotation-register crops so the eye "
+                                       "line is horizontal in every sampled "
+                                       "crop (similarity transform, "
+                                       "inverse-warped on paste-back); "
+                                       "needs a landmark-capable detector"}),
     }
 
 
@@ -73,6 +93,14 @@ def _detail_inputs():
                               "tooltip": "main quality/consistency lever: "
                                          "higher = more detail but more "
                                          "flicker (0.3-0.45 recommended)"}),
+        "denoise_max": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                                  "step": 0.01,
+                                  "tooltip": "adaptive denoise: when above "
+                                             "'denoise', steady frames keep "
+                                             "the low base value while "
+                                             "high-motion frames ramp "
+                                             "toward this. 0 = off (single "
+                                             "global denoise)"}),
         "noise_mode": (["fixed_per_track", "per_frame"],
                        {"default": "fixed_per_track",
                         "tooltip": "fixed_per_track reuses the same seed "
@@ -94,8 +122,24 @@ def _detail_inputs():
         "flow_strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,
                                     "step": 0.05,
                                     "tooltip": "optical-flow-guided temporal "
-                                               "blend of detailed crops"}),
+                                               "blend of detailed crops "
+                                               "(pixel space)"}),
+        "latent_blend": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0,
+                                   "step": 0.05,
+                                   "tooltip": "flow-guided temporal blend in "
+                                              "LATENT space before decode — "
+                                              "smooths in the VAE's semantic "
+                                              "space, letting you raise "
+                                              "denoise with less flicker. "
+                                              "Try 0.3-0.5 with denoise "
+                                              "0.25+; 0 = off"}),
         "flow_bidirectional": ("BOOLEAN", {"default": True}),
+        "flow_backend": (FLOW_BACKENDS,
+                         {"default": "farneback",
+                          "tooltip": "raft_small/raft_large (torchvision) "
+                                     "give much cleaner flow on fast motion "
+                                     "at some VRAM/time cost; auto-falls "
+                                     "back to farneback on any failure"}),
         "color_match": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,
                                   "step": 0.05,
                                   "tooltip": "match each detailed crop's "
@@ -120,15 +164,33 @@ def _optional_cond_inputs():
             "multiline": True, "default": "",
             "tooltip": "per-track positive prompt overrides, one per line: "
                        "'track_id: prompt' (see the debug overlay for IDs)"}),
+        "reference_image": ("IMAGE", {
+            "tooltip": "identity anchor: a reference face image the "
+                       "detailed faces are biased toward (init-latent nudge "
+                       "+ color anchoring). For strong identity conditioning "
+                       "also patch the MODEL with IPAdapter FaceID upstream "
+                       "— crops are sampled with whatever model you feed "
+                       "in, so it composes"}),
+        "reference_strength": ("FLOAT", {
+            "default": 0.35, "min": 0.0, "max": 1.0, "step": 0.05,
+            "tooltip": "how hard to pull toward reference_image (no effect "
+                       "unless it is connected)"}),
     }
+
+
+_OPT_DEFAULTS = {"denoise_max": 0.0, "latent_blend": 0.0,
+                 "flow_backend": "farneback", "reference_strength": 0.35}
 
 
 def _collect_opts(kw):
     keys = ("guide_size", "max_size", "seed", "steps", "cfg", "sampler_name",
-            "scheduler", "denoise", "noise_mode", "detail_mode",
-            "mask_dilation", "feather", "temporal_strength", "flow_strength",
-            "flow_bidirectional", "color_match", "chunk_size", "detail_every")
-    return {k: kw[k] for k in keys}
+            "scheduler", "denoise", "denoise_max", "noise_mode",
+            "detail_mode", "mask_dilation", "feather", "temporal_strength",
+            "flow_strength", "latent_blend", "flow_bidirectional",
+            "flow_backend", "color_match", "chunk_size", "detail_every",
+            "reference_strength")
+    return {k: kw.get(k, _OPT_DEFAULTS.get(k)) if k in _OPT_DEFAULTS
+            else kw[k] for k in keys}
 
 
 def _resolve_conditioning(clip, positive, negative,
@@ -144,7 +206,8 @@ def _resolve_conditioning(clip, positive, negative,
 
 def run_detect_track(image, detector, det_threshold, min_face_size, max_faces,
                      detector_device, iou_threshold, max_track_gap,
-                     min_track_length, crop_factor, crop_smoothing):
+                     min_track_length, crop_factor, crop_smoothing,
+                     crop_anchor="landmarks", align_rotation=False):
     n, h, w = image.shape[0], image.shape[1], image.shape[2]
     det = FaceDetector(backend=detector, device=detector_device,
                        det_threshold=det_threshold,
@@ -160,7 +223,9 @@ def run_detect_track(image, detector, det_threshold, min_face_size, max_faces,
                           max_gap=max_track_gap,
                           min_track_length=min_track_length)
     face_tracks = tracks_to_face_tracks(tracks, w, h, n,
-                                        crop_factor, crop_smoothing)
+                                        crop_factor, crop_smoothing,
+                                        crop_anchor=crop_anchor,
+                                        align_rotation=align_rotation)
     print(f"[TemporalFaceDetailer] {len(face_tracks['tracks'])} track(s) "
           f"across {n} frames (detector: {det.backend})")
     return face_tracks
@@ -197,12 +262,12 @@ class TemporalFaceDetailer:
 
     def detail(self, image, model, clip, vae, positive_text, negative_text,
                positive=None, negative=None, lora_stack=None,
-               track_prompts="", **kw):
+               track_prompts="", reference_image=None, **kw):
         face_tracks = run_detect_track(
             image, kw["detector"], kw["det_threshold"], kw["min_face_size"],
             kw["max_faces"], kw["detector_device"], kw["iou_threshold"],
             kw["max_track_gap"], kw["min_track_length"], kw["crop_factor"],
-            kw["crop_smoothing"])
+            kw["crop_smoothing"], kw["crop_anchor"], kw["align_rotation"])
 
         positive, negative = _resolve_conditioning(
             clip, positive, negative, positive_text, negative_text)
@@ -210,7 +275,8 @@ class TemporalFaceDetailer:
         out, masks = detail_tracks(
             image, face_tracks, model, clip, vae, positive, negative,
             _collect_opts(kw), lora_stack=lora_stack,
-            track_prompt_overrides=parse_track_prompts(track_prompts))
+            track_prompt_overrides=parse_track_prompts(track_prompts),
+            reference_image=reference_image)
 
         debug = draw_debug_overlay(image, face_tracks)
         return (out, masks, debug, face_tracks)
@@ -235,7 +301,7 @@ class FaceDetectTrack:
             image, kw["detector"], kw["det_threshold"], kw["min_face_size"],
             kw["max_faces"], kw["detector_device"], kw["iou_threshold"],
             kw["max_track_gap"], kw["min_track_length"], kw["crop_factor"],
-            kw["crop_smoothing"])
+            kw["crop_smoothing"], kw["crop_anchor"], kw["align_rotation"])
         return (face_tracks, draw_debug_overlay(image, face_tracks))
 
 
@@ -268,13 +334,14 @@ class TrackedFaceDetail:
 
     def detail(self, image, face_tracks, model, clip, vae, positive_text,
                negative_text, positive=None, negative=None, lora_stack=None,
-               track_prompts="", **kw):
+               track_prompts="", reference_image=None, **kw):
         positive, negative = _resolve_conditioning(
             clip, positive, negative, positive_text, negative_text)
         out, masks = detail_tracks(
             image, face_tracks, model, clip, vae, positive, negative,
             _collect_opts(kw), lora_stack=lora_stack,
-            track_prompt_overrides=parse_track_prompts(track_prompts))
+            track_prompt_overrides=parse_track_prompts(track_prompts),
+            reference_image=reference_image)
         return (out, masks)
 
 
@@ -288,19 +355,21 @@ class TemporalSmooth:
             "strength": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0,
                                    "step": 0.05}),
             "bidirectional": ("BOOLEAN", {"default": True}),
+            "flow_backend": (FLOW_BACKENDS, {"default": "farneback"}),
         }}
 
     RETURN_TYPES = ("IMAGE",)
     FUNCTION = "smooth"
     CATEGORY = CATEGORY
 
-    def smooth(self, image, strength, bidirectional):
+    def smooth(self, image, strength, bidirectional, flow_backend="farneback"):
         if image.shape[0] < 2 or strength <= 0.0:
             return (image,)
         frames = [tensor_frame_to_np_f32(image[i])
                   for i in range(image.shape[0])]
         out = flow_blend_sequence(frames, frames, strength,
-                                  bidirectional=bidirectional)
+                                  bidirectional=bidirectional,
+                                  flow_fn=get_flow_fn(flow_backend))
         return (np_to_tensor(np.stack(out, axis=0)),)
 
 

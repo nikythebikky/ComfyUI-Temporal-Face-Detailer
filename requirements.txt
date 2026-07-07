@@ -6,3 +6,6 @@ onnxruntime>=1.16
 opencv-python>=4.8
 numpy>=1.24
 scipy>=1.10
+# Optional: enables the yolo:* anime-face detector backends
+# (models go in ComfyUI/models/ultralytics/bbox/)
+# ultralytics>=8.0
