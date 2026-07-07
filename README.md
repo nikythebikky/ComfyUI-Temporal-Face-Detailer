@@ -4,12 +4,14 @@
 the video equivalent of Impact Pack's `FaceDetailer` — while suppressing the
 temporal **flicker** that naive per-frame detailing produces.
 
-It detects and **tracks faces across frames** (stable identities, stabilized
-crops), re-details each tracked face with SDXL img2img/inpaint using a
-**fixed per-track seed and noise**, blends results with **optical-flow-guided
-temporal smoothing**, and feather-pastes only the face region back — so
-backgrounds stay pixel-exact and the output recombines into a video with the
-same frame count and order.
+It detects and **tracks faces across frames** (stable identities,
+landmark-stabilized crops), re-details each tracked face with SDXL
+img2img/inpaint using a **fixed per-track seed and noise**, blends results
+with **optical-flow-guided temporal smoothing** (pixel and/or latent space),
+optionally anchors identity to a **reference image**, and feather-pastes
+only the face region back — so backgrounds stay pixel-exact and the output
+recombines into a video with the same frame count and order. Works on
+realistic and (via YOLO detector models) **anime/stylized** faces.
 
 ```
 Load Video → TemporalFaceDetailer → Video Combine
@@ -46,8 +48,8 @@ Notes:
 | **Temporal Face Detailer** (all-in-one) | Full pipeline in one node: detect → track → detail → smooth → paste back. Outputs frames, face masks, a debug overlay and the `FACE_TRACKS`. |
 | **Face Detect + Track** | Detection + tracking + crop stabilization only. Outputs `FACE_TRACKS` + debug overlay. |
 | **Tracked Face Detail (SDXL)** | Details all tracks from a `FACE_TRACKS` input. Outputs frames + masks. |
-| **Temporal Smooth (flow blend)** | Standalone flow-guided anti-flicker blend for any `IMAGE` sequence. |
-| **Face Track Preview** | Visualize tracks (bboxes, stabilized crop windows, landmarks, IDs). |
+| **Temporal Smooth (flow blend)** | Standalone flow-guided anti-flicker blend for any `IMAGE` sequence (Farneback or RAFT). |
+| **Face Track Preview** | Visualize tracks (bboxes + confidence, stabilized crop windows, landmarks, IDs, gap frames, rotation angle). |
 | **TFD LoRA Stack** | Chainable `LORA_STACK` builder for face LoRAs applied inside the detailer. |
 
 The all-in-one node and the split path share the same internals — use the
@@ -69,11 +71,12 @@ Load Checkpoint ──MODEL──────────────┐
         └────────VAE─────────────────┤
                                      ▼
 Load Video ──IMAGE──▶  Temporal Face Detailer  ──image──────▶ Video Combine
-                             │                 ──face_masks──▶ (optional: Preview/Save)
-                             │                 ──debug_overlay▶ Video Combine (2nd one, to inspect tracks)
-                             │                 ──face_tracks─▶ (optional: Face Track Preview)
-                       type prompts into
-                       positive_text / negative_text
+                             │       ▲         ──face_masks──▶ (optional: Preview/Save)
+                             │       │         ──debug_overlay▶ Video Combine (2nd one, to inspect tracks)
+                             │       │         ──face_tracks─▶ (optional: Face Track Preview)
+                       type prompts  │
+                       into positive_text /    Load Image ──IMAGE──▶ reference_image
+                       negative_text           (optional identity anchor)
 ```
 
 Socket by socket:
@@ -85,6 +88,7 @@ Socket by socket:
 | `positive_text` / `negative_text` | type prompts directly (widgets, no wire needed) |
 | `positive` / `negative` (optional) | CLIP Text Encode → `CONDITIONING`, if you prefer encode nodes; these override the text widgets |
 | `lora_stack` (optional) | TFD LoRA Stack → `LORA_STACK` |
+| `reference_image` (optional) | Load Image → `IMAGE` — a clean face image of the target identity; enables the anti-drift reference anchor (strength via the `reference_strength` widget) |
 
 | Output | Connect to |
 |--------|-----------|
@@ -122,6 +126,9 @@ TFD LoRA Stack ──LORA_STACK──(optional)───────────
    frames again — the detailer needs the original pixels).
 5. Checkpoint `MODEL`/`CLIP`/`VAE` → **Tracked Face Detail**.
 6. **Tracked Face Detail** `image` → **Video Combine** `images`.
+7. Optional: **Load Image** `IMAGE` → **Tracked Face Detail**
+   `reference_image` (identity anchor — same input as on the all-in-one
+   node).
 
 **Temporal Smooth** is already applied inside Tracked Face Detail (on the
 face crops, controlled by `flow_strength`). The standalone node is for
@@ -265,16 +272,21 @@ Identity stability first, enhancement second:
   sampled and decoded, `chunk_size` frames at a time, per track, with cache
   flushes between tracks. Full frames are never re-encoded.
 - `detector_device: cpu` offloads detection if you need every MB of VRAM
-  (flow runs on CPU/OpenCV already).
+  (Farneback flow runs on CPU/OpenCV already).
+- `flow_backend: raft_small`/`raft_large` loads a small torchvision RAFT
+  model (~1M/5M params) on the GPU, capped at 512 px inputs; it is freed
+  after each run and **any** failure (no weights, OOM) falls back to
+  Farneback automatically — it can never hard-fail a render.
 - For long clips, `detail_every: 2-4` samples keyframes only and propagates
   detail via optical flow — a large speedup at a small quality cost.
 
 ## FACE_TRACKS type
 
 A plain dict: `{width, height, num_frames, tracks: [{track_id, seed_offset,
-frames: {frame_idx: {bbox, kps, score, crop, interpolated}}}]}` — `crop` is
-the stabilized square crop, `interpolated` marks occlusion-gap frames filled
-by interpolation.
+frames: {frame_idx: {bbox, kps, score, crop, angle, interpolated}}}]}` —
+`crop` is the stabilized square crop, `angle` the smoothed eye-line rotation
+in degrees (0.0 unless `align_rotation` is on), `interpolated` marks
+occlusion-gap frames filled by interpolation.
 
 ## Acceptance behavior
 
